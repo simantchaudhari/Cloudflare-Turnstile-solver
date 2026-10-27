@@ -4,9 +4,20 @@ const { execSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 
-const PORT = process.env.PORT || 6767;
-const POOL_SIZE = parseInt(process.env.POOL_SIZE || '30', 10);
+function getArg(flags, envVal, defaultVal) {
+    for (const flag of (Array.isArray(flags) ? flags : [flags])) {
+        const idx = process.argv.indexOf(flag);
+        if (idx !== -1 && process.argv[idx + 1]) return process.argv[idx + 1];
+        const prefixArg = process.argv.find(a => a.startsWith(flag + '='));
+        if (prefixArg) return prefixArg.split('=')[1];
+    }
+    return envVal !== undefined && envVal !== '' ? envVal : defaultVal;
+}
+
+const PORT = parseInt(getArg(['--port', '-P'], process.env.PORT, '6767'), 10);
+const POOL_SIZE = parseInt(getArg(['--pool', '-p'], process.env.POOL_SIZE, '5'), 10);
 const TIMEOUT = 30;
+const HEADLESS = getArg('--headless', process.env.HEADLESS, 'false') === 'true';
 
 const HTML_UI = `<!DOCTYPE html>
 <html lang="en">
@@ -360,16 +371,25 @@ const HTML_UI = `<!DOCTYPE html>
 
 function buildPage(siteKey) {
     return `<!DOCTYPE html>
-<html><head>
-<script>
-window.addEventListener("message",function(m){
-if(m.origin!=="https://challenges.cloudflare.com"||!m.data)return;
-if(m.data.event==="interactiveBegin")window.__ci=1;
-});
-</` + `script>
-<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></` + `script>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <script>
+    window.addEventListener("message", function(m){
+        if (m.origin !== "https://challenges.cloudflare.com" || !m.data) return;
+        if (m.data.event === "interactiveBegin") window.__ci = 1;
+    });
+    </script>
+    <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #0d0d0d; padding: 25px; }
+        .cf-turnstile { display: inline-block; width: 300px; height: 65px; }
+    </style>
 </head>
-<body><div class="cf-turnstile" data-sitekey="${siteKey}"></div></body>
+<body>
+    <div class="cf-turnstile" data-sitekey="${siteKey}"></div>
+</body>
 </html>`;
 }
 
@@ -378,14 +398,15 @@ const ctxPool = [];
 
 async function grabCtx() {
     if (ctxPool.length > 0) return ctxPool.shift();
-    return await browser.newContext({ viewport: null });
+    return await browser.newContext({ viewport: { width: 1280, height: 720 } });
 }
 
 async function dropCtx(ctx) {
     if (ctxPool.length < POOL_SIZE) {
+        await ctx.clearCookies().catch(() => {});
         ctxPool.push(ctx);
     } else {
-        await ctx.close();
+        await ctx.close().catch(() => {});
     }
 }
 
@@ -408,10 +429,12 @@ function findPatchrightExe() {
             if (!fs.existsSync(base)) continue;
             for (const d of fs.readdirSync(base)) {
                 if (d.toLowerCase().includes('patchright') || d.toLowerCase().includes('chromium')) {
-                    const winExe = path.join(base, d, 'chrome-win', 'chrome.exe');
-                    const linuxExe = path.join(base, d, 'chrome-linux', 'chrome');
-                    if (fs.existsSync(winExe)) return winExe;
-                    if (fs.existsSync(linuxExe)) return linuxExe;
+                    for (const sub of ['chrome-linux64', 'chrome-linux', 'chrome-win']) {
+                        for (const exe of ['chrome', 'chrome.exe']) {
+                            const p = path.join(base, d, sub, exe);
+                            if (fs.existsSync(p)) return p;
+                        }
+                    }
                 }
             }
         } catch {}
@@ -420,7 +443,8 @@ function findPatchrightExe() {
 }
 
 async function solve(siteUrl, siteKey, timeout = TIMEOUT) {
-    if (!siteUrl.endsWith('/')) siteUrl += '/';
+    let target = siteUrl.trim();
+    if (!target.endsWith('/')) target += '/';
     const t0 = Date.now();
     const ctx = await grabCtx();
     const pg = await ctx.newPage();
@@ -428,44 +452,58 @@ async function solve(siteUrl, siteKey, timeout = TIMEOUT) {
 
     try {
         const html = buildPage(siteKey);
-        await pg.route(siteUrl, r => r.fulfill({ body: html, status: 200 }));
-        await pg.goto(siteUrl, { timeout: 15000 });
+        await pg.route(target, r => r.fulfill({ body: html, status: 200, contentType: 'text/html' }));
+        await pg.goto(target, { waitUntil: 'domcontentloaded', timeout: 15000 });
 
         while (Date.now() - t0 < timeout * 1000) {
             const [tok, ci] = await pg.evaluate(`[
-                document.querySelector('[name=cf-turnstile-response]')?.value||null,
-                window.__ci||0
+                document.querySelector('[name=cf-turnstile-response]')?.value || null,
+                window.__ci || 0
             ]`);
 
-            if (tok && tok.length > 50) {
+            if (tok && tok.length > 30) {
                 const elapsed = Math.round((Date.now() - t0) / 10) / 100;
-                return { by: 'lol', time: elapsed, success: true, token: tok };
+                return { success: true, token: tok, time: elapsed };
             }
 
             if (ci && !clicked) {
                 clicked = true;
-                setTimeout(async () => {
-                    try {
-                        const box = await pg.locator('.cf-turnstile').boundingBox();
-                        if (!box) return;
-                        const tx = box.x + 25, ty = box.y + box.height / 2;
-                        await pg.mouse.move(tx + 55, ty + 18);
-                        await new Promise(r => setTimeout(r, 100));
-                        await pg.mouse.move(tx, ty, { steps: 5 });
-                        await new Promise(r => setTimeout(r, 80));
-                        await pg.mouse.click(tx, ty);
-                    } catch {}
-                }, 180);
+                await new Promise(r => setTimeout(r, 400));
+                try {
+                    const cfFrame = pg.frames().find(f => f.url().includes('challenges.cloudflare.com'));
+                    let box = null;
+                    if (cfFrame) {
+                        try {
+                            const frameEl = await cfFrame.frameElement();
+                            box = await frameEl.boundingBox();
+                        } catch {}
+                    }
+                    if (!box) {
+                        box = await pg.locator('.cf-turnstile').boundingBox().catch(() => null);
+                    }
+
+                    if (box) {
+                        const clickX = box.x + 30;
+                        const clickY = box.y + box.height / 2;
+                        await pg.mouse.move(clickX + 35, clickY + 12);
+                        await new Promise(r => setTimeout(r, 50));
+                        await pg.mouse.move(clickX, clickY, { steps: 5 });
+                        await new Promise(r => setTimeout(r, 50));
+                        await pg.mouse.down();
+                        await new Promise(r => setTimeout(r, 60));
+                        await pg.mouse.up();
+                    }
+                } catch {}
             }
 
-            await new Promise(r => setTimeout(r, 250));
+            await new Promise(r => setTimeout(r, 150));
         }
 
         return { success: false, err: 'timeout' };
     } catch (e) {
         return { success: false, err: e.message };
     } finally {
-        await pg.close();
+        await pg.close().catch(() => {});
         await dropCtx(ctx);
     }
 }
@@ -489,31 +527,35 @@ app.get('/health', (req, res) => res.json({ ok: true, pool: ctxPool.length }));
 
 async function main() {
     const exePath = findPatchrightExe();
+    if (exePath) {
+        console.log(`[INFO] Using Chromium binary: ${exePath}`);
+    } else {
+        console.log(`[WARN] Patchright/custom Chromium not found, falling back to default Playwright browser`);
+    }
 
     browser = await chromium.launch({
         executablePath: exePath || undefined,
-        headless: process.env.HEADLESS !== 'false',
+        headless: HEADLESS,
         args: [
             '--no-sandbox',
             '--disable-dev-shm-usage',
-            '--disable-gpu',
-            '--disable-extensions',
-            '--disable-background-networking',
-            '--disable-background-timer-throttling',
-            '--disable-backgrounding-occluded-windows',
-            '--disable-renderer-backgrounding',
-            '--no-first-run',
             '--disable-blink-features=AutomationControlled',
+            '--no-first-run'
         ]
     });
 
+    console.log(`[INFO] Browser launched (headless: ${HEADLESS}). Initializing pool of ${POOL_SIZE} contexts...`);
     for (let i = 0; i < POOL_SIZE; i++) {
-        ctxPool.push(await browser.newContext({ viewport: null }));
+        ctxPool.push(await browser.newContext({ viewport: { width: 1280, height: 720 } }));
     }
 
     app.listen(PORT, '0.0.0.0', () => {
-        console.log(`  GET http://localhost:${PORT}/solve?url=<site>&sitekey=<key>`);
+        console.log(`[INFO] Server running at http://0.0.0.0:${PORT}`);
+        console.log(`       GET http://localhost:${PORT}/solve?url=<site>&sitekey=<key>`);
     });
 }
 
-main().catch(() => process.exit(1));
+main().catch(err => {
+    console.error('[FATAL ERROR]:', err);
+    process.exit(1);
+});

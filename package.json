@@ -1,7 +1,11 @@
 {
   "name": "turnstile",
   "version": "1.0.0",
-  "main": "x.js",
+  "main": "Turnstile_Solver.js",
+  "scripts": {
+    "start": "node Turnstile_Solver.js",
+    "start:xvfb": "xvfb-run -a --server-args='-screen 0 1920x1080x24 -ac' node Turnstile_Solver.js"
+  },
   "dependencies": {
     "@playwright/test": "^1.62.1",
     "express": "^4.18.0",
